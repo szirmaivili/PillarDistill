@@ -7,6 +7,8 @@ import random
 import os
 import torch
 import center_head
+import centernet_loss
+tf.config.run_functions_eagerly(True)
 
 # Pillarizáció
 
@@ -289,6 +291,30 @@ class config:
             self.circular_nms = circular_nms
 
 test_cfg = config()
+focal_loss = centernet_loss.FastFocalLoss()
+
+def raw_preds_2_preds_dicts(raw_preds: dict, dimensions: dict):
+    # Batch méretű objektumok: B, H, W, C. NEM KELL A DIMENZIÓKAT PERMUTÁLNI
+    preds_dicts = []
+
+    # hm hozzáadása:
+    preds_dicts.append({'hm': raw_preds['hm'][..., 0:1]})
+    preds_dicts.append({'hm': raw_preds['hm'][..., 1:3]})
+    preds_dicts.append({'hm': raw_preds['hm'][..., 3:5]})
+    preds_dicts.append({'hm': raw_preds['hm'][..., 5:6]})
+    preds_dicts.append({'hm': raw_preds['hm'][..., 6:8]})
+    preds_dicts.append({'hm': raw_preds['hm'][..., 8:10]})
+
+    # Többi fej hozzáadása: 
+    for i in range(6):
+
+        for key in dimensions.keys():
+
+            preds_dicts[i].update({key: raw_preds[key][..., i*dimensions[key]//6 : (i+1)*dimensions[key]//6]})
+
+    return preds_dicts
+
+dimensions = {'reg': 12, 'height':6,'dim':18,'rot':12,'vel':12,'iou':6}
 
 class MapDistillTrainer(tf.keras.Model):
     def __init__(self, student, w, use_tp_fp_fn, lambda_1, lambda_2, **kwargs):
@@ -331,16 +357,50 @@ class MapDistillTrainer(tf.keras.Model):
         return tp, fn, fp
 
 
-    @tf.function
+    #@tf.function
+    @tf.autograph.experimental.do_not_convert
     def train_step(self, data):
 
         bev = data['bev']         
         teacher = data['teacher']                                # dict of (B,180,180,Ck)
         mask_fg = data.get('mask_fg', None)                      # (B,180,180,1)
+        tokenss = data['tokenss']
 
         with tf.GradientTape() as tape:
             out = self.student(bev, training=True)
             loss = 0.0
+            hm_loss = 0.0
+
+            preds_dicts = raw_preds_2_preds_dicts(raw_preds=out, dimensions=dimensions)
+
+            examples = []
+            for t in tokenss:
+                t_bytes = t.numpy()
+                t_str = t_bytes.decode("utf-8")
+                with open(os.path.join(r'/PillarDistill/teacher_examples', t_str + ".pkl"), "rb") as f:
+                    examples.append(pickle.load(f))
+
+            # 🔹 Most stackelheted őket batch-dim mentén
+            num_tasks = 6
+            ex = {"hm": [], "ind": [], "mask": [], "cat": []}
+            for key in ex.keys():
+                for task_id in range(num_tasks):
+                    task_spec = [examples[b][key][task_id] for b in range(len(examples))]
+                    ex[key].append(np.stack(task_spec, axis=0))
+
+            # Focal loss: 
+
+            for task_id, preds_dict in enumerate(preds_dicts):
+                preds_dict['hm'] = tf.sigmoid(preds_dict['hm'])
+                hm_loss += focal_loss(
+                    preds_dict['hm'],
+                    ex['hm'][task_id],   
+                    ex['ind'][task_id],
+                    ex['mask'][task_id],
+                    ex['cat'][task_id]
+                )
+                
+            loss += self.lambda_2*hm_loss
 
             # Heatmap (teacher probbá alakítva a stabilitás kedvéért)
             hm_t = teacher['hm']
@@ -348,77 +408,15 @@ class MapDistillTrainer(tf.keras.Model):
             hm_s_logits = out['hm']
             hm_s_prob = tf.sigmoid(hm_s_logits)
 
-            # Így nézett ki ereddetileg a loss számítás
-
-            # if self.use_tp_fp_fn:
-            #     tp, fn, fp = self.make_tp_fp_fn_masks(hm_t_prob, hm_s_logits, thr=0.1)
-            #     w = tf.stop_gradient(1.0 * (tp + fn) + 0.25 * fp)
-
-            # elif mask_fg is not None:
-            #     w = tf.stop_gradient(mask_fg)
-
-            # else:
-            #     w = None
-
-            # if w is not None:
-            #     # maszkolt BCE
-            #     bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=hm_t_prob, logits=hm_s_logits)
-            #     l_hm = tf.reduce_sum(bce * w) / (tf.reduce_sum(w) + 1e-6)
-
-            #     # maszkolt KL
-            #     teacher_probs = tf.nn.softmax(hm_t / 2.0, axis=-1)
-            #     student_log_probs = tf.nn.log_softmax(hm_s_logits / 2.0, axis=-1)
-            #     kl = tf.reduce_sum(
-            #         teacher_probs * (tf.math.log(teacher_probs + 1e-8) - student_log_probs),
-            #         axis=-1, keepdims=True
-            #     )
-            #     l_hm_kl = tf.reduce_sum(kl * w) / (tf.reduce_sum(w) + 1e-6) * (2.0 * 2.0)
-            # else:
-            #     # fallback: teljes térképen
-            #     l_hm = self.bce_from_logits(hm_t_prob, hm_s_logits)
-            #     l_hm_kl = self.kl_divergence(hm_s_logits, hm_t, T=2.0)
-
-            # loss += 0.5 * self.w.get('hm', 1.0) * (l_hm + l_hm_kl)
-
-            # # Maszkos L1 a regressziókra
-            # def masked_l1(t, s):
-            #     if mask_fg is None:
-            #         return self.mae(t, s)
-            #     w = tf.stop_gradient(mask_fg)
-            #     num = tf.reduce_sum(tf.abs(t - s) * w)
-            #     den = tf.reduce_sum(w) + 1e-6
-            #     return num / den
-
-            # for name in ['reg', 'height','dim','rot','vel','iou']:
-            #     if name in out and name in teacher and name in self.w:
-            #         loss += 0.5 * self.w[name] * masked_l1(teacher[name], out[name])
-
-            # Új loss számítás:
-
-            student_mask = make_fg_mask_from_hm(hm_s_logits)
-
-            mask_bce_loss = tf.keras.losses.BinaryCrossentropy(
-                from_logits=False, reduction=tf.keras.losses.Reduction.SUM_OVER_BATCH_SIZE
-            )(mask_fg, student_mask)
-
-            loss += self.lambda_1*mask_bce_loss * 1.0
+            ce_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+                    labels=tf.sigmoid(teacher['hm']),  # teacher prob
+                    logits=out['hm']               # student logit
+                )
             
-            tp_regions = mask_fg * student_mask
+            ce_loss = tf.reduce_sum(ce_loss * mask_fg) / (tf.reduce_sum(mask_fg) + 1e-6)
 
-            if tf.reduce_sum(tp_regions) > 0:
+            loss += self.lambda_1*ce_loss
 
-                teacher_max_channel_idx_per_pixel = tf.argmax(hm_t_prob, axis=-1)
-                
-                sample_weights = tf.stop_gradient(tp_regions)
-
-                channel_classification_loss = tf.keras.losses.SparseCategoricalCrossentropy(
-                    from_logits = False,
-                    reduction = tf.keras.losses.Reduction.NONE
-                )(teacher_max_channel_idx_per_pixel, hm_s_prob)
-                weighted_channel_loss = tf.reduce_sum(tf.expand_dims(channel_classification_loss, axis=-1) * sample_weights) / tf.maximum(1.0, tf.reduce_sum(sample_weights))
-
-                loss += self.lambda_1*weighted_channel_loss * 1.0
-                
             for name in ['reg', 'height','dim','rot','vel','iou']:
 
                 if name in out and name in teacher and name in self.w:
@@ -437,16 +435,6 @@ class MapDistillTrainer(tf.keras.Model):
 
                     loss += self.lambda_1*self.w[name] * head_mse_loss
                     
-            # preds_dicts = make_preds_dicts_from_student(student_outputs=out, tasks=tasks)
-            # example = make_example_from_teacher(teacher_outputs=teacher, tasks=tasks, mask_fg=mask_fg)
-
-            # loss_label = self.cent_head.loss(example=example, preds_dicts=preds_dicts, test_cfg = test_cfg)
-
-            # for k, v in loss_label.items():
-            #     # v lista, általában 1 elem vagy batch-nyi tensor
-            #     # összegzés / átlagolás kell
-            #     val = tf.reduce_mean(tf.concat([tf.reshape(x, [-1]) for x in v], axis=0))
-            #     loss += self.lambda_2 * val
 
         grads = tape.gradient(loss, self.student.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.student.trainable_variables))
@@ -499,7 +487,7 @@ def make_streaming_dataset_pillars(tokens, point_folder, pickle_folder, heads, b
                 "bev": np.stack(bevs, axis=0).astype(np.float32),
                 "teacher": {k: np.stack(teach[k], axis=0) for k in ch.keys()},
                 "mask_fg": np.stack(masks, axis=0),
-                "tokenss": np.array(tokenss)
+                "tokenss": np.array(tokenss),
             }
             yield batch
 

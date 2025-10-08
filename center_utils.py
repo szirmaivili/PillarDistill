@@ -65,24 +65,97 @@ def draw_umich_gaussian(heatmap, center, radius, k=1):
     return heatmap
 
 
+# def _gather_feat(feat, ind, mask=None):
+#     dim = tf.shape(feat)[2]
+#     ind = tf.squeeze(ind, axis=0)
+#     ind = tf.reshape(ind, [tf.shape(feat)[0], -1])  # erőszakosan (B, M)
+#     ind = tf.expand_dims(ind, -1)
+#     ind = tf.tile(ind, [1, 1, dim])
+#     feat = tf.gather(feat, ind, batch_dims=1)
+#     if mask is not None:
+#         mask = tf.expand_dims(mask, 2)
+#         mask = tf.tile(mask, [1, 1, dim])
+#         feat = tf.boolean_mask(feat, mask)
+#         feat = tf.reshape(feat, [-1, dim])
+#     return feat
+
+
+# def _transpose_and_gather_feat(feat, ind):
+#     #feat = tf.transpose(feat, [0, 2, 3, 1])
+#     feat = tf.reshape(feat, [tf.shape(feat)[0], -1, tf.shape(feat)[-1]])
+#     feat = _gather_feat(feat, ind)
+#     return feat
+
+# def _gather_feat(feat, ind, mask=None):
+#     """
+#     TensorFlow reimplementációja a CenterNet/PillarNet gather függvényének.
+#     feat: (B, N, C)
+#     ind:  (B, M)
+#     """
+#     print("🟦 feat shape:", feat.shape)
+#     print("🟨 ind shape:", ind.shape)
+#     print("feat dtype:", feat.dtype)
+#     print("ind dtype:", ind.dtype)
+#     dim = tf.shape(feat)[2]            # C
+#     B = tf.shape(feat)[0]              # batch size
+#     if len(ind.shape) == 1:
+#         ind = tf.expand_dims(ind, 0)
+#     ind = tf.expand_dims(ind, -1)               # (B, M, 1)
+#     ind = tf.tile(ind, [1, 1, dim])    # (B, M, C)
+#     M = tf.shape(ind)[1]               # num objects
+
+#     # expand indexek a feature-dim irányába
+    
+
+#     # batch gather
+#     feat_gathered = tf.gather(feat, ind, batch_dims=1)
+
+#     # maszk alkalmazása, ha van
+#     if mask is not None:
+#         mask_exp = tf.expand_dims(mask, -1)
+#         mask_exp = tf.tile(mask_exp, [1, 1, dim])
+#         feat_gathered = tf.boolean_mask(feat_gathered, mask_exp)
+#         feat_gathered = tf.reshape(feat_gathered, [-1, dim])
+
+#     return feat_gathered
+
 def _gather_feat(feat, ind, mask=None):
-    dim = tf.shape(feat)[2]
-    ind = tf.squeeze(ind, axis=0)
-    ind = tf.reshape(ind, [tf.shape(feat)[0], -1])  # erőszakosan (B, M)
-    ind = tf.expand_dims(ind, -1)
-    ind = tf.tile(ind, [1, 1, dim])
-    feat = tf.gather(feat, ind, batch_dims=1)
+    """
+    TensorFlow reimplementációja a CenterNet/PillarNet gather függvényének.
+    feat: (B, N, C)
+    ind:  (B, M)
+    """
+    # Ha ind egydimenziós, tegyük batchbe
+    if len(ind.shape) == 1:
+        ind = tf.expand_dims(ind, 0)  # (1, M)
+
+    # Győződjünk meg róla, hogy B egyezik
+    if tf.shape(ind)[0] != tf.shape(feat)[0]:
+        ind = tf.expand_dims(ind, 0)
+
+    # Gyűjtés batch szinten
+    feat_gathered = tf.gather(feat, ind, batch_dims=1)  # (B, M, C)
+
+    # Ha van mask, alkalmazzuk
     if mask is not None:
-        mask = tf.expand_dims(mask, 2)
-        mask = tf.tile(mask, [1, 1, dim])
-        feat = tf.boolean_mask(feat, mask)
-        feat = tf.reshape(feat, [-1, dim])
-    return feat
+        mask = tf.cast(mask, tf.bool)
+        mask = tf.expand_dims(mask, -1)
+        feat_gathered = tf.boolean_mask(feat_gathered, mask)
+        feat_gathered = tf.reshape(feat_gathered, [-1, tf.shape(feat)[-1]])
+
+    return feat_gathered  # (B, M, C)
 
 
 def _transpose_and_gather_feat(feat, ind):
-    #feat = tf.transpose(feat, [0, 2, 3, 1])
-    feat = tf.reshape(feat, [tf.shape(feat)[0], -1, tf.shape(feat)[-1]])
+    """
+    feat: (B, C, H, W)
+    ind:  (B, M)
+    """
+    # TensorFlow-os permute
+    #feat = tf.transpose(feat, [0, 2, 3, 1])  # (B, H, W, C)
+    if len(tf.shape(feat)) == 3:  # (H, W, C)
+        feat = tf.expand_dims(feat, 0)
+    feat = tf.reshape(feat, [tf.shape(feat)[0], -1, tf.shape(feat)[-1]])  # (B, H*W, C)
     feat = _gather_feat(feat, ind)
     return feat
 
