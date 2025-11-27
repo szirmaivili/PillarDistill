@@ -187,7 +187,7 @@ class Bbox(tf.keras.Model):
 
             heads["reg"] =      SepHead(64, 2,   "reg",    task_id)
             heads["height"] =   SepHead(64, 1,   "height", task_id)
-            heads["dim"] =      SepHead(64, 2,   "dim",    task_id)
+            heads["dim"] =      SepHead(64, 3,   "dim",    task_id)
             heads["rot"] =      SepHead(64, 2,   "rot",    task_id)
             heads["vel"] =      SepHead(64, 2,   "vel",    task_id)
             heads["iou"] =      SepHead(64, 1,   "iou",    task_id)
